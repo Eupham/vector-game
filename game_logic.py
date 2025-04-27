@@ -14,6 +14,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import datetime  # Add this import
 from neural_networks import RegressionNetwork  # Use RegressionNetwork alias
+from training_config import TrainingConfigPanel, start_training
 
 class VectorGame:
     def __init__(self, headless=False):
@@ -224,7 +225,7 @@ class VectorGame:
         # Training Session button (second from bottom)
         self.training_button = Button(self.side_panel.rect.x + 20, 
                                     button_y_positions[1], 200, button_height, 
-                                    "Training Session", self.colors['button'], 
+                                    "Training Config", self.colors['button'], 
                                     self.colors['button_hover'])
         
         # Dashboard button (third from bottom)
@@ -251,7 +252,7 @@ class VectorGame:
         # Create rules UI and settings UI
         self.create_rules_ui()
         self.create_settings_ui()
-        
+        self.training_config_ui = TrainingConfigPanel(self, self.screen_width, self.screen_height)
         # Initialize show_help flag
         self.show_help = False
         
@@ -357,6 +358,7 @@ class VectorGame:
         
         # Create game over screen
         self.game_over_ui = GameOverScreen(self, self.screen_width, self.screen_height)
+        self.show_training_config = False
 
     def create_rules_ui(self):
         """Create the rules UI panel with scrollable content"""
@@ -539,8 +541,8 @@ class VectorGame:
             self.show_help = True
             
         if self.training_button.update(events):
-            self.run_training_session()
-            
+            # Open the training config panel instead of immediately running a training session
+            self.show_training_config = True            
         # Handle settings panel updates
         if self.show_settings:
             result = self.settings_ui.update(events)
@@ -567,6 +569,23 @@ class VectorGame:
                 self.status_message = "Selecting model file..."
                 self.status_label.update_text(self.status_message)
         
+        # Handle training config panel updates
+        if self.show_training_config:
+            result = self.training_config_ui.update(events)
+            
+            if result == 'apply':
+                # Just apply the settings without closing
+                self.status_message = "Training configuration applied."
+                self.status_label.update_text(self.status_message)
+            elif result == 'close':
+                self.show_training_config = False
+            elif result == 'start_training':
+                # Start training with the configured settings
+                self.show_training_config = False
+                success, message = start_training(self)
+                self.status_message = message
+                self.status_label.update_text(self.status_message)
+
         # Handle dashboard panel updates
         if self.show_dashboard:
             result = self.dashboard_ui.update(events)
@@ -686,6 +705,10 @@ class VectorGame:
         # Draw settings panel if open
         if self.show_settings:
             self.render_settings_panel()
+        
+        # Draw training config panel if open
+        if self.show_training_config:
+            self.training_config_ui.draw(self.screen)
         
         # Draw dashboard if open
         if self.show_dashboard:
@@ -848,6 +871,17 @@ class VectorGame:
         # Create optimizer
         self.regression_optimizer = optim.Adam(self.regression_net.parameters(), lr=self.learning_rate)
         self.value_optimizer = self.regression_optimizer
+
+        # Initialize Blue model from Red model weights for dual training
+        self.blue_regression_net = RegressionNetwork(
+            num_vertices=num_v,
+            embed_dim=self.hidden_dim,
+            hidden_dim=self.hidden_dim,
+            num_layers=self.num_layers
+        ).to(self.device)
+        self.blue_regression_net.load_state_dict(self.regression_net.state_dict())
+        # Optimizer for Blue model
+        self.blue_regression_optimizer = optim.Adam(self.blue_regression_net.parameters(), lr=self.learning_rate)
         
         # Generate model file name based on board size
         self.model_file = Path(f"vector_game_model_{len(self.all_vertices)}.pt")
@@ -1157,7 +1191,50 @@ class VectorGame:
                 return random.choice([self.all_vertices[i] for i in valid_actions])
 
     def get_blue_move(self, clicks, aggression=None):
-        """AI logic for Blue's move using purely heuristic approach."""
+        """AI logic for Blue's move with neural net or heuristic approach"""
+        # Neural net branch for Blue using swapped perspective
+        use_nn = self.use_neural_net and random.random() < (self.neural_net_ratio / 100)
+        if use_nn:
+            valid_actions = self.get_valid_actions(clicks)
+            if not valid_actions:
+                return None
+            # Tokenize and swap occupancy: red<->blue
+            state_idx, occ_orig = self.state_to_tokens(clicks)
+            occ = occ_orig.clone()
+            red_mask = occ_orig == 1; blue_mask = occ_orig == 2
+            occ[red_mask] = 2; occ[blue_mask] = 1
+            # Evaluate candidates with Blue model
+            if len(valid_actions)==1:
+                best_idx=valid_actions[0]; best_move=self.all_vertices[best_idx]
+            else:
+                bidx, boccs = [],[]
+                for ai in valid_actions:
+                    tmp=occ.clone(); tmp[ai]=1
+                    bidx.append(state_idx.clone()); boccs.append(tmp)
+                bidx=torch.stack(bidx); boccs=torch.stack(boccs)
+                with torch.no_grad():
+                    scores=self.blue_regression_net(bidx,boccs).squeeze()
+                if scores.dim()==0: sel=0
+                else: sel=torch.argmax(scores).item()
+                best_idx=valid_actions[sel]; best_move=self.all_vertices[best_idx]
+            # compute swapped reward
+            loops_before=self.find_formed_loops(clicks,self.load_valid_loops())
+            lc_before=self.get_loop_colors(loops_before,clicks)
+            rsb,bsb=self.calculate_scores(lc_before)
+            temp=clicks.copy(); temp.append({'turn':0,'color':'blue','address':best_move})
+            loops_after=self.find_formed_loops(temp,self.load_valid_loops())
+            lc_after=self.get_loop_colors(loops_after,temp)
+            rsa,bsa=self.calculate_scores(lc_after)
+            # points from blue perspective as red: reward = (blue gain) - (red gain)
+            rew=(bsa-bsb) - (rsa-rsb)
+            # next state tokens swap
+            nidx,nocc_orig=self.state_to_tokens(temp)
+            nocc=nocc_orig.clone(); red_mask=nocc_orig==1; blue_mask=nocc_orig==2
+            nocc[red_mask]=2; nocc[blue_mask]=1
+            # train Blue model
+            self.td_update_blue(state_idx,occ,rew,nidx,nocc,is_terminal=False)
+            return best_move
+        # ...existing heuristic code...
         # Use passed aggression parameter or fallback
         if aggression is None:
             if hasattr(self, 'blue_ai_aggression'):
@@ -2430,26 +2507,53 @@ class VectorGame:
             pygame.time.wait(2000)  # Wait 2 seconds before resetting
 
     def run_training_session(self):
-        """Run a training session with Red (100% neural network) vs Blue (purely heuristic)"""
+        """Run a training session with custom Red and Blue settings from the training config panel"""
         # Store original settings
         original_use_neural_net = self.use_neural_net
         original_neural_net_ratio = self.neural_net_ratio
         original_red_first_prob = self.red_first_prob
         original_status = self.status_message
+        original_red_ai_aggression = self.red_ai_aggression
         original_blue_ai_aggression = getattr(self, 'blue_ai_aggression', self.red_ai_aggression)
         
-        # Set training specific settings
+        # Set training specific settings using the custom training configuration
         self.use_neural_net = True
-        self.neural_net_ratio = 100  # 100% neural network usage for Red
-        self.red_first_prob = 50     # Equal chance for first move
-        if not hasattr(self, 'blue_ai_aggression'):
-            self.blue_ai_aggression = self.red_ai_aggression  # Initialize blue aggression if not set
+        
+        # Use settings from training config if they exist, otherwise use defaults
+        red_episodes = getattr(self, 'red_episodes', 100)
+        red_ai_heur_ratio = getattr(self, 'red_ai_heur_ratio', 50)
+        blue_ai_heur_ratio = getattr(self, 'blue_ai_heur_ratio', 50)
+        red_greedy_random_ratio = getattr(self, 'red_greedy_random_ratio', 50) 
+        blue_greedy_random_ratio = getattr(self, 'blue_greedy_random_ratio', 50)
+        red_locked = getattr(self, 'red_locked', False)
+        blue_locked = getattr(self, 'blue_locked', False)
+        red_end_ai_ratio = getattr(self, 'red_end_ai_ratio', 50)
+        blue_end_ai_ratio = getattr(self, 'blue_end_ai_ratio', 50)
+        
+        # Convert AI/Heuristic ratio to neural_net_ratio for Red
+        self.neural_net_ratio = red_ai_heur_ratio
+        
+        # Set Red's aggression based on greedy/random ratio
+        self.red_ai_aggression = red_greedy_random_ratio
+        
+        # Set Blue's aggression based on greedy/random ratio
+        self.blue_ai_aggression = blue_greedy_random_ratio
+        
+        # Equal chance for first move (you could make this configurable too)
+        self.red_first_prob = 50
         
         # Clear previous training stats
         self.stats['training_value_losses'] = []
         self.stats['training_red_wins'] = 0
         self.stats['training_blue_wins'] = 0
         self.stats['training_ties'] = 0
+        
+        # Log training settings
+        print(f"Starting training with settings:")
+        print(f"Red: AI/Heur={red_ai_heur_ratio}%, Greedy/Random={red_greedy_random_ratio}%, " +
+              f"Locked={red_locked}, End AI={red_end_ai_ratio}%, Episodes={red_episodes}")
+        print(f"Blue: AI/Heur={blue_ai_heur_ratio}%, Greedy/Random={blue_greedy_random_ratio}%, " +
+              f"Locked={blue_locked}, End AI={blue_end_ai_ratio}%, Episodes={getattr(self, 'blue_episodes', 100)}")
         
         # Setup training progress display
         progress_panel = Panel(
@@ -2468,7 +2572,7 @@ class VectorGame:
         progress_label = Label(
             progress_panel.rect.centerx, 
             progress_panel.rect.centery,
-            "Training in progress: Game 1/100", 
+            f"Training in progress: Game 1/{red_episodes}", 
             (0, 0, 0), 
             24, 
             "center"
@@ -2489,6 +2593,15 @@ class VectorGame:
             20, 
             "center"
         )
+        # Federated learning indicator
+        fed_label = Label(
+            progress_panel.rect.centerx,
+            progress_panel.rect.centery + 100,
+            "Federated averaging: ON",
+            (0, 0, 0),
+            20,
+            "center"
+        )
         cancel_button = Button(
             progress_panel.rect.centerx - 50, 
             progress_panel.rect.bottom - 50,
@@ -2505,13 +2618,16 @@ class VectorGame:
         # Flag to track if training was cancelled
         training_cancelled = False
         
-        # Run 100 training games
-        for game_num in range(1, 101):
+        # Get number of episodes from config (default to 100 if not set)
+        num_episodes = red_episodes
+        
+        # Run training games
+        for game_num in range(1, num_episodes + 1):
             if training_cancelled:
                 break
                 
             # Update progress display
-            progress_label.update_text(f"Training in progress: Game {game_num}/100")
+            progress_label.update_text(f"Training in progress: Game {game_num}/{num_episodes}")
             
             if len(self.stats['value_losses']) > 0:
                 avg_loss = sum(self.stats['value_losses'][-100:]) / min(len(self.stats['value_losses']), 100)
@@ -2531,6 +2647,7 @@ class VectorGame:
             progress_label.draw(self.screen)
             avg_loss_label.draw(self.screen)
             stats_label.draw(self.screen)
+            fed_label.draw(self.screen)
             cancel_button.draw(self.screen)
             pygame.display.flip()
             
@@ -2558,13 +2675,22 @@ class VectorGame:
             current_player = 'red' if random.random() < (self.red_first_prob / 100) else 'blue'
             turn_number = 0
             
+            # For staged training (if enabled via locked mode)
+            if red_locked and game_num > num_episodes / 2:
+                # Second half: increase neural net influence for Red
+                self.neural_net_ratio = red_end_ai_ratio
+            
+            if blue_locked and game_num > num_episodes / 2:
+                # Second half: increase aggression for Blue
+                self.blue_ai_aggression = blue_end_ai_ratio
+                
             while len(clicks) < len(self.all_vertices):
                 # Get AI move for current player
                 if current_player == 'red':
-                    # Red uses neural network (as configured above with 100% neural net ratio)
+                    # Red uses neural network with configured ratio
                     move = self.get_red_move(clicks)
                 else:
-                    # Blue uses purely heuristic with blue_ai_aggression
+                    # Blue uses heuristic with blue_ai_aggression
                     move = self.get_blue_move(clicks, self.blue_ai_aggression)
                 
                 if move:
@@ -2603,6 +2729,7 @@ class VectorGame:
                     progress_label.draw(self.screen)
                     avg_loss_label.draw(self.screen)
                     stats_label.draw(self.screen)
+                    fed_label.draw(self.screen)
                     cancel_button.draw(self.screen)
                     pygame.display.flip()
                 
@@ -2630,9 +2757,23 @@ class VectorGame:
                         'regression_state': self.regression_net.state_dict(),
                         'value_state': self.value_net.state_dict()
                     }
+                    
+                    # Save versioned model with episode count and timestamp
+                    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                    models_dir = Path('models')
+                    models_dir.mkdir(parents=True, exist_ok=True)
+                    model_path = models_dir / f"vector_game_model_{len(self.all_vertices)}_ep{game_num}_{timestamp}.pt"
+                    torch.save(model_data, model_path)
+                    
+                    # Also update the current model file
                     torch.save(model_data, self.model_file)
                 except Exception as e:
                     print(f"Error saving model: {e}")
+            
+            # Federated averaging: merge Red and Blue perspectives
+            for rp,bp in zip(self.regression_net.parameters(), self.blue_regression_net.parameters()):
+                avg=(rp.data+bp.data)*0.5
+                rp.data.copy_(avg); bp.data.copy_(avg)
             
             # Process events to keep UI responsive
             for event in pygame.event.get():
@@ -2656,6 +2797,7 @@ class VectorGame:
         self.use_neural_net = original_use_neural_net
         self.neural_net_ratio = original_neural_net_ratio
         self.red_first_prob = original_red_first_prob
+        self.red_ai_aggression = original_red_ai_aggression
         self.blue_ai_aggression = original_blue_ai_aggression
         
         # Reset the game for normal play
@@ -2699,6 +2841,39 @@ class VectorGame:
         
         # Use batch training capability
         loss = self.regression_net.train_step(state_idx, state_occ, target_norm, self.regression_optimizer)
+        
+        # Record actual TD error (unnormalized) for monitoring
+        td_error = raw_target - value.item()
+        self.stats['td_errors'].append(td_error)
+        
+        return loss
+
+    def td_update_blue(self, state_idx, state_occ, reward, next_state_idx=None, next_state_occ=None, is_terminal=False):
+        """Perform a TD(0) update for the Blue value (regression) network."""
+        # Get current value estimate
+        value = self.blue_regression_net(state_idx, state_occ)
+        
+        # Compute raw TD target
+        if is_terminal or next_state_idx is None:
+            raw_target = float(reward)
+        else:
+            with torch.no_grad():
+                next_value = self.blue_regression_net(next_state_idx, next_state_occ).item()
+            raw_target = reward + self.gamma * next_value
+        
+        # Update running buffer and compute normalization stats
+        self.target_buffer.append(raw_target)
+        import numpy as _np
+        mean = _np.mean(self.target_buffer)
+        std = _np.std(self.target_buffer)
+        if std < 1e-6:
+            std = 1.0
+        
+        # Normalize target
+        target_norm = (raw_target - mean) / std
+        
+        # Use batch training capability
+        loss = self.blue_regression_net.train_step(state_idx, state_occ, target_norm, self.blue_regression_optimizer)
         
         # Record actual TD error (unnormalized) for monitoring
         td_error = raw_target - value.item()
