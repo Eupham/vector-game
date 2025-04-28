@@ -46,8 +46,21 @@ class CPU:
         masked_probs = probs * mask
         masked_probs = masked_probs / (masked_probs.sum() + 1e-10)
         m = Categorical(masked_probs)
-        action_idx = m.sample()
-        log_prob = m.log_prob(action_idx)
+        # Monte Carlo consensus: draw multiple samples and pick the mode at test time
+        consensus_k = getattr(self.game, 'consensus_samples', 1)
+        if consensus_k > 1:
+            samples = m.sample((consensus_k,))
+            # count occurrences to find mode
+            vals = samples.tolist()
+            counts = {}
+            for v in vals:
+                counts[v] = counts.get(v, 0) + 1
+            mode_idx = max(counts, key=counts.get)
+            action_idx = torch.tensor(mode_idx, device=probs.device)
+            log_prob = m.log_prob(action_idx)
+        else:
+            action_idx = m.sample()
+            log_prob = m.log_prob(action_idx)
         self.game.policy_net.saved_log_probs.append(log_prob.detach().requires_grad_())
         self.game.policy_net.saved_states.append(state)
         self.game.policy_net.current_state = state

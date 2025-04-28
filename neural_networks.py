@@ -1,6 +1,52 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
+from collections import deque
+import numpy as np
+
+class ExperienceBuffer:
+    """Buffer to store and sample experiences for training"""
+    
+    def __init__(self, buffer_size=10000):
+        self.buffer = deque(maxlen=buffer_size)
+        
+    def add(self, state_idx, state_occ, reward, next_state_idx=None, next_state_occ=None, terminal=False):
+        """Add an experience to the buffer"""
+        experience = (state_idx, state_occ, reward, next_state_idx, next_state_occ, terminal)
+        self.buffer.append(experience)
+        
+    def sample(self, batch_size):
+        """Sample a batch of experiences randomly"""
+        if batch_size > len(self.buffer):
+            batch_size = len(self.buffer)
+            
+        batch = random.sample(self.buffer, batch_size)
+        
+        state_idxs = torch.stack([exp[0] for exp in batch if exp[0] is not None])
+        state_occs = torch.stack([exp[1] for exp in batch if exp[1] is not None])
+        rewards = torch.tensor([exp[2] for exp in batch], dtype=torch.float32)
+        
+        # Handle next states (which might be None for terminal states)
+        next_idxs = [exp[3] for exp in batch if exp[3] is not None]
+        next_occs = [exp[4] for exp in batch if exp[4] is not None]
+        terminals = torch.tensor([exp[5] for exp in batch], dtype=torch.bool)
+        
+        if next_idxs and next_occs:
+            next_state_idxs = torch.stack(next_idxs)
+            next_state_occs = torch.stack(next_occs)
+        else:
+            next_state_idxs = None
+            next_state_occs = None
+            
+        return state_idxs, state_occs, rewards, next_state_idxs, next_state_occs, terminals
+        
+    def __len__(self):
+        return len(self.buffer)
+        
+    def is_ready(self, batch_size):
+        """Check if the buffer has enough experiences to sample a batch"""
+        return len(self.buffer) >= batch_size
 
 class RMSNorm(nn.Module):
     """RMS normalization without any learned weights."""

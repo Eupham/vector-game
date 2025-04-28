@@ -15,11 +15,11 @@ from torch.distributions import Categorical
 import datetime  # Add this import
 from neural_networks import RegressionNetwork  # Use RegressionNetwork alias
 from training_config import TrainingConfigPanel, start_training
+# Import quiescence search implementation
+from ai import integrate_quiescence_search, QuiescenceSearch
 
 class VectorGame:
     def __init__(self, headless=False):
-        # Headless mode skips UI and pygame display
-        self.headless = headless
         # Initialize game parameters, neural params, and state
         self.init_game_parameters()
         
@@ -32,7 +32,7 @@ class VectorGame:
         
         # Initialize necessary files
         self.init_files()
-        
+        self.headless = headless
         if not self.headless:
             # Initialize pygame and UI
             pygame.init()
@@ -115,6 +115,9 @@ class VectorGame:
         self.gamma = 0.99  # Discount factor for rewards
         # Running buffer of TD targets for z-normalization
         self.target_buffer = deque(maxlen=1000)
+        
+        # Monte Carlo consensus parameters
+        self.consensus_samples = 1  # Default to no consensus (just single sampling)
         
         # Neural network architecture parameters
         self.hidden_dim = 128  # Default hidden dimension
@@ -421,36 +424,39 @@ class VectorGame:
         
         # Settings sliders
         self.depth_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 80, 
-                                500, 20, 1, 6, self.depth, text="Depth")
+                                500, 20, 1, 6, self.depth, text="Search Depth")
         
         self.scale_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 130, 
                                 500, 20, 0.5, 2.0, self.scale_multiplier, text="Visual Scale")
         
+        # Keep red_first_slider as percentage (0-100)
         self.red_first_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 180, 
                                     500, 20, 0, 100, self.red_first_prob, text="Red First Probability (%)")
         
-        self.red_aggression_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 230, 
-                                        500, 20, 0, 100, self.red_ai_aggression, text="Red AI Aggression (%)")
+        # Convert red_ai_aggression_slider to -1 to 1 scale
+        self.red_ai_aggression_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 230, 
+                                        500, 20, -1, 1, self.red_ai_aggression_normalized, text="Strategy (Defensive ← → Aggressive)")
         
         self.heuristic_evals_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 280, 
-                                        500, 20, 5, 50, self.max_heuristic_evals, text="Max Moves to Evaluate")
+                                        500, 20, 5, 50, self.max_heuristic_evals, text="AI Search Breadth")
         
         # Neural network settings
         self.use_neural_net_checkbox = Checkbox(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 330, 
                                             20, "Use Neural Network", self.use_neural_net)
         
+        # Convert neural_net_ratio_slider to -1 to 1 scale
         self.neural_net_ratio_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 370, 
-                                            500, 20, 0, 100, self.neural_net_ratio, text="Neural Net Ratio (%)")
+                                            500, 20, -1, 1, self.neural_net_ratio_normalized, text="Decision Style (Heuristic ← → Neural)")
         
         self.learning_rate_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 420, 
                                         500, 20, 0.0001, 0.01, self.learning_rate, text="Learning Rate")
                                         
         # Neural network architecture settings
         self.hidden_dim_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 470, 
-                                    500, 20, 32, 1024, self.hidden_dim, text="Hidden Dimension")
+                                    500, 20, 32, 1024, self.hidden_dim, text="Network Width")
                                     
         self.num_layers_slider = Slider(self.settings_panel.rect.x + 50, self.settings_panel.rect.y + 520, 
-                                    500, 20, 1, 8, self.num_layers, text="Number of Layers")
+                                    500, 20, 1, 8, self.num_layers, text="Network Depth")
         
         # Apply and Close buttons
         self.apply_settings_button = Button(self.settings_panel.rect.right - 120, self.settings_panel.rect.bottom - 60, 
@@ -1016,7 +1022,356 @@ class VectorGame:
         return valid_actions
     
     def get_red_move(self, clicks):
-        """AI logic for Red's move with regression-based move evaluation using batch processing"""
+        """AI logic for Red's move with a two-layer decision approach:
+        1. Quiescence vs Greedy (based on red_ai_aggression slider)
+        2. AI vs Heuristic evaluation (based on neural_net_ratio slider)
+        """
+        # Get valid actions first - common to all approaches
+        valid_actions = self.get_valid_actions(clicks)
+        if not valid_actions:
+            return None
+            
+        # If there's only one valid move, just take it
+        if len(valid_actions) == 1:
+            return self.all_vertices[valid_actions[0]]
+        
+        # FIRST LAYER: Decide between Quiescence Search and Greedy approach
+        use_quiescence = random.random() < (self.red_ai_aggression / 100)
+        
+        if use_quiescence:
+            # Use the quiescence search approach
+            # SECOND LAYER: Decide between AI and heuristic evaluation for quiescence
+            use_ai_eval = self.use_neural_net and random.random() < (self.neural_net_ratio / 100)
+            
+            # Try quiescence search with selected evaluation method
+            move = integrate_quiescence_search(
+                self,
+                clicks,
+                is_red_turn=True,
+                max_depth=self.depth,
+                use_nn=use_ai_eval  # Use AI evaluation based on neural_net_ratio
+            )
+            
+            # If quiescence search found a good move, return it
+            if move:
+                # Double-check the move is valid
+                for existing_click in clicks:
+                    if self.is_same_vertex(existing_click['address'], move):
+                        print(f"Warning: Quiescence search returned already occupied position: {move}")
+                        return self.get_random_valid_move(valid_actions)  # Fall back to random valid move
+                
+                # If using AI evaluation, do TD learning
+                if use_ai_eval:
+                    # Tokenize current state
+                    state_idx, state_occ = self.state_to_tokens(clicks)
+                    
+                    # Compute reward for training
+                    valid_loops = self.load_valid_loops()
+                    formed_loops_before = self.find_formed_loops(clicks, valid_loops)
+                    loop_colors_before = self.get_loop_colors(formed_loops_before, clicks)
+                    red_score_before, blue_score_before = self.calculate_scores(loop_colors_before)
+                    
+                    # Score after move
+                    temp_clicks = clicks.copy()
+                    temp_clicks.append({'turn': 0, 'color': 'red', 'address': move})
+                    formed_loops_after = self.find_formed_loops(temp_clicks, valid_loops)
+                    loop_colors_after = self.get_loop_colors(formed_loops_after, temp_clicks)
+                    red_score_after, blue_score_after = self.calculate_scores(loop_colors_after)
+                    
+                    # Calculate points earned by each player
+                    points_earned = red_score_after - red_score_before
+                    blue_points_earned = blue_score_after - blue_score_before
+                    reward = points_earned - blue_points_earned
+                    
+                    # Perform TD update
+                    next_idx, next_occ = self.state_to_tokens(temp_clicks)
+                    loss = self.td_update(state_idx, state_occ, reward, next_idx, next_occ, is_terminal=False)
+                    if loss is not None:
+                        self.stats['value_losses'].append(loss)
+                
+                return move
+        
+        # If we're here, either we're using the greedy approach or quiescence didn't find a move
+        # GREEDY APPROACH: Take highest scoring move
+        # SECOND LAYER: Decide between AI and heuristic evaluation for greedy
+        use_ai_eval = self.use_neural_net and random.random() < (self.neural_net_ratio / 100)
+        
+        if use_ai_eval:
+            # Use neural network to evaluate moves
+            # Tokenize current state
+            state_idx, state_occ = self.state_to_tokens(clicks)
+            
+            # Create batch of all possible next states
+            batch_indices = []
+            batch_occs = []
+            
+            # For each potential move, create a new state
+            for action_idx in valid_actions:
+                move = self.all_vertices[action_idx]
+                # Generate the occupancy state after this move
+                temp_occ = state_occ.clone()
+                temp_occ[action_idx] = 1  # Red = 1
+                batch_indices.append(state_idx.clone())
+                batch_occs.append(temp_occ)
+            
+            # Stack into batches for efficient evaluation
+            batch_vertex_indices = torch.stack(batch_indices)
+            batch_occs = torch.stack(batch_occs)
+            
+            # Evaluate all moves at once
+            with torch.no_grad():
+                predicted_scores = self.regression_net(batch_vertex_indices, batch_occs).squeeze()
+            
+            # Find the best move
+            if predicted_scores.dim() == 0:  # Only one score (scalar tensor)
+                best_idx = 0  # Only one move, so index is 0
+                best_score = predicted_scores.item()
+            else:  # Multiple scores (vector tensor)
+                best_idx = torch.argmax(predicted_scores).item()
+                best_score = predicted_scores[best_idx].item()
+            
+            best_action_idx = valid_actions[best_idx]
+            best_move = self.all_vertices[best_action_idx]
+            
+            # Double-check the move is valid
+            for existing_click in clicks:
+                if self.is_same_vertex(existing_click['address'], best_move):
+                    print(f"Warning: Neural network returned already occupied position: {best_move}")
+                    return self.get_random_valid_move(valid_actions)  # Fall back to random valid move
+            
+            # Compute reward for training
+            valid_loops = self.load_valid_loops()
+            formed_loops_before = self.find_formed_loops(clicks, valid_loops)
+            loop_colors_before = self.get_loop_colors(formed_loops_before, clicks)
+            red_score_before, blue_score_before = self.calculate_scores(loop_colors_before)
+            
+            # Score after move
+            temp_clicks = clicks.copy()
+            temp_clicks.append({'turn': 0, 'color': 'red', 'address': best_move})
+            formed_loops_after = self.find_formed_loops(temp_clicks, valid_loops)
+            loop_colors_after = self.get_loop_colors(formed_loops_after, temp_clicks)
+            red_score_after, blue_score_after = self.calculate_scores(loop_colors_after)
+            
+            # Calculate points earned by each player
+            points_earned = red_score_after - red_score_before
+            blue_points_earned = blue_score_after - blue_score_before
+            reward = points_earned - blue_points_earned
+            
+            # Perform TD update
+            next_idx, next_occ = self.state_to_tokens(temp_clicks)
+            loss = self.td_update(state_idx, state_occ, reward, next_idx, next_occ, is_terminal=False)
+            if loss is not None:
+                self.stats['value_losses'].append(loss)
+                
+            return best_move
+        else:
+            # Use heuristic evaluation - find potential scoring moves
+            scoring_moves = []
+            
+            # Calculate score before any moves (only once)
+            valid_loops = self.load_valid_loops()
+            formed_loops_before = self.find_formed_loops(clicks, valid_loops)
+            loop_colors_before = self.get_loop_colors(formed_loops_before, clicks)
+            red_score_before, blue_score_before = self.calculate_scores(loop_colors_before)
+            
+            # Find potentially scoring vertices using spatial hashing
+            potentially_scoring_vertices = set()
+            
+            # Get all placed vertices
+            placed_vertices = [click['address'] for click in clicks]
+            
+            # For each placed vertex, find nearby vertices that might complete triangles
+            for vertex in placed_vertices:
+                r, theta = vertex
+                
+                # Get all vertex indices near this one
+                nearby_indices = self.get_nearby_vertices(r, theta, radius=0.3)
+                
+                # Filter to only include valid (unplayed) actions
+                nearby_indices = [idx for idx in nearby_indices if idx in valid_actions]
+                
+                # Add to the set of potentially scoring vertices
+                potentially_scoring_vertices.update(nearby_indices)
+            
+            # If we found potentially scoring vertices, evaluate those first
+            potentially_scoring_list = list(potentially_scoring_vertices)
+            
+            if potentially_scoring_list:
+                evaluation_indices = (random.sample(potentially_scoring_list, min(self.max_heuristic_evals, len(potentially_scoring_list))))
+            else:
+                # If no potential scoring vertices found, use regular sampling
+                evaluation_indices = random.sample(valid_actions, min(self.max_heuristic_evals, len(valid_actions)))
+            
+            # Convert indices to actual vertex coordinates
+            unplayed_moves = [self.all_vertices[i] for i in evaluation_indices]
+            
+            # Evaluate each potential move
+            for move in unplayed_moves:
+                # Double-check the move is valid (safety check)
+                move_already_taken = False
+                for existing_click in clicks:
+                    # Use the same tolerance as in is_same_vertex function
+                    if self.is_same_vertex(existing_click['address'], move):
+                        move_already_taken = True
+                        print(f"Warning: Heuristic evaluation attempted to evaluate already taken position: {move}")
+                        break
+                
+                if move_already_taken:
+                    continue
+                
+                # Temporarily add this move to evaluate scores
+                temp_clicks = clicks.copy()
+                temp_clicks.append({'turn': 0, 'color': 'red', 'address': move})
+                formed_loops_after = self.find_formed_loops(temp_clicks, valid_loops)
+                loop_colors_after = self.get_loop_colors(formed_loops_after, temp_clicks)
+                red_score_after, blue_score_after = self.calculate_scores(loop_colors_after)
+                
+                # Calculate points earned and score difference
+                points_earned = red_score_after - red_score_before
+                score_difference = (red_score_after - blue_score_after) - (red_score_before - blue_score_before)
+                weighted_score = 3.0 * points_earned + score_difference
+                
+                scoring_moves.append((move, weighted_score))
+            
+            # Sort all moves by score (even if points_earned == 0)
+            scoring_moves.sort(key=lambda x: x[1], reverse=True)
+            
+            # If there are scoring moves, choose the highest scoring one
+            if scoring_moves:
+                return scoring_moves[0][0]
+            else:
+                # Fallback - should never happen as we evaluate all possible moves
+                return self.get_random_valid_move(valid_actions)
+    
+    def get_random_valid_move(self, valid_actions):
+        """Helper function to get a random valid move"""
+        return self.all_vertices[random.choice(valid_actions)]
+
+    def get_blue_move(self, clicks, aggression=None):
+        """AI logic for Blue's move with neural net or heuristic approach"""
+        # Neural net branch for Blue using swapped perspective
+        use_nn = self.use_neural_net and random.random() < (self.neural_net_ratio / 100)
+        if use_nn:
+            valid_actions = self.get_valid_actions(clicks)
+            if not valid_actions:
+                return None
+            # Tokenize and swap occupancy: red<->blue
+            state_idx, occ_orig = self.state_to_tokens(clicks)
+            occ = occ_orig.clone()
+            red_mask = occ_orig == 1; blue_mask = occ_orig == 2
+            occ[red_mask] = 2; occ[blue_mask] = 1
+            # Evaluate candidates with Blue model
+            if len(valid_actions)==1:
+                best_idx=valid_actions[0]; best_move=self.all_vertices[best_idx]
+            else:
+                bidx, boccs = [],[]
+                for ai in valid_actions:
+                    tmp=occ.clone(); tmp[ai]=1
+                    bidx.append(state_idx.clone()); boccs.append(tmp)
+                bidx=torch.stack(bidx); boccs=torch.stack(boccs)
+                with torch.no_grad():
+                    scores=self.blue_regression_net(bidx,boccs).squeeze()
+                if scores.dim()==0: sel=0
+                else: sel=torch.argmax(scores).item()
+                best_idx=valid_actions[sel]; best_move=self.all_vertices[best_idx]
+            # compute swapped reward
+            loops_before=self.find_formed_loops(clicks,self.load_valid_loops())
+            lc_before=self.get_loop_colors(loops_before,clicks)
+            rsb,bsb=self.calculate_scores(lc_before)
+            temp=clicks.copy(); temp.append({'turn':0,'color':'blue','address':best_move})
+            loops_after=self.find_formed_loops(temp,self.load_valid_loops())
+            lc_after=self.get_loop_colors(loops_after,temp)
+            rsa,bsa=self.calculate_scores(lc_after)
+            # points from blue perspective as red: reward = (blue gain) - (red gain)
+            rew=(bsa-bsb) - (rsa-rsb)
+            # next state tokens swap
+            nidx,nocc_orig=self.state_to_tokens(temp)
+            nocc=nocc_orig.clone(); red_mask=nocc_orig==1; blue_mask=nocc_orig==2
+            nocc[red_mask]=2; nocc[blue_mask]=1
+            # train Blue model
+            self.td_update_blue(state_idx,occ,rew,nidx,nocc,is_terminal=False)
+            return best_move
+        # quiescence search branch for Blue
+        if random.random() < (self.red_ai_aggression / 100):
+            move = integrate_quiescence_search(
+                self,
+                clicks,
+                is_red_turn=False,
+                max_depth=self.depth,
+                use_nn=self.use_neural_net
+            )
+            if move:
+                return move
+        # Use passed aggression parameter or fallback
+        if aggression is None:
+            if hasattr(self, 'blue_ai_aggression'):
+                aggression = self.blue_ai_aggression
+            else:
+                aggression = self.red_ai_aggression
+        
+        # Determine if this move should be aggressive
+        make_aggressive_move = random.random() < (aggression / 100)
+        valid_actions = self.get_valid_actions(clicks)
+        
+        if not valid_actions:
+            return None
+            
+        if make_aggressive_move:
+            scoring_moves = []
+            valid_loops = self.load_valid_loops()
+            formed_loops_before = self.find_formed_loops(clicks, valid_loops)
+            loop_colors_before = self.get_loop_colors(formed_loops_before, clicks)
+            red_score_before, blue_score_before = self.calculate_scores(loop_colors_before)
+            
+            # Find potentially scoring vertices
+            potentially_scoring_vertices = set()
+            placed_vertices = [click['address'] for click in clicks]
+            
+            for vertex in placed_vertices:
+                r, theta = vertex
+                nearby_indices = self.get_nearby_vertices(r, theta, radius=0.3)
+                nearby_indices = [idx for idx in nearby_indices if idx in valid_actions]
+                potentially_scoring_vertices.update(nearby_indices)
+            
+            potentially_scoring_list = list(potentially_scoring_vertices)
+            
+            if potentially_scoring_list:
+                evaluation_indices = (random.sample(potentially_scoring_list, self.max_heuristic_evals)
+                                    if len(potentially_scoring_list) > self.max_heuristic_evals
+                                    else potentially_scoring_list)
+            else:
+                evaluation_indices = (random.sample(valid_actions, self.max_heuristic_evals)
+                                    if len(valid_actions) > self.max_heuristic_evals
+                                    else valid_actions)
+            
+            unplayed_moves = [self.all_vertices[i] for i in evaluation_indices]
+            
+            for move in unplayed_moves:
+                temp_click = {'turn': 0, 'color': 'blue', 'address': move}
+                temp_clicks = clicks.copy()
+                temp_clicks.append(temp_click)
+                formed_loops_after = self.find_formed_loops(temp_clicks, valid_loops)
+                loop_colors_after = self.get_loop_colors(formed_loops_after, temp_clicks)
+                red_score_after, blue_score_after = self.calculate_scores(loop_colors_after)
+                
+                points_earned = blue_score_after - blue_score_before
+                score_difference = (blue_score_after - red_score_after) - (blue_score_before - red_score_before)
+                weighted_score = 3.0 * points_earned + score_difference
+                
+                if points_earned > 0:
+                    scoring_moves.append((move, weighted_score))
+            
+            if scoring_moves:
+                scoring_moves.sort(key=lambda x: x[1], reverse=True)
+                return scoring_moves[0][0]
+            else:
+                return random.choice([self.all_vertices[i] for i in valid_actions])
+        else:
+            # Make a random move
+            return random.choice([self.all_vertices[i] for i in valid_actions])
+
+    def get_training_red_move(self, clicks, valid_loops):
+        """AI logic for Red's move during training - uses cached valid_loops for efficiency"""
         # Decide whether to use neural network or heuristic
         use_nn = self.use_neural_net and random.random() < (self.neural_net_ratio / 100)
         
@@ -1071,7 +1426,7 @@ class VectorGame:
                 best_move = self.all_vertices[best_action_idx]
             
             # Compute actual reward for training
-            valid_loops = self.load_valid_loops()
+            # OPTIMIZATION: Use cached valid_loops instead of loading from disk
             formed_loops_before = self.find_formed_loops(clicks, valid_loops)
             loop_colors_before = self.get_loop_colors(formed_loops_before, clicks)
             red_score_before, blue_score_before = self.calculate_scores(loop_colors_before)
@@ -1117,7 +1472,7 @@ class VectorGame:
                 scoring_moves = []
                 
                 # Calculate score before any moves (only once)
-                valid_loops = self.load_valid_loops()
+                # OPTIMIZATION: Use cached valid_loops
                 formed_loops_before = self.find_formed_loops(clicks, valid_loops)
                 loop_colors_before = self.get_loop_colors(formed_loops_before, clicks)
                 red_score_before, blue_score_before = self.calculate_scores(loop_colors_before)
@@ -1190,19 +1545,21 @@ class VectorGame:
                 # Make a random move from valid actions
                 return random.choice([self.all_vertices[i] for i in valid_actions])
 
-    def get_blue_move(self, clicks, aggression=None):
-        """AI logic for Blue's move with neural net or heuristic approach"""
+    def get_training_blue_move(self, clicks, valid_loops, aggression=None):
+        """AI logic for Blue's move during training - uses cached valid_loops for efficiency"""
         # Neural net branch for Blue using swapped perspective
         use_nn = self.use_neural_net and random.random() < (self.neural_net_ratio / 100)
         if use_nn:
             valid_actions = self.get_valid_actions(clicks)
             if not valid_actions:
                 return None
+                
             # Tokenize and swap occupancy: red<->blue
             state_idx, occ_orig = self.state_to_tokens(clicks)
             occ = occ_orig.clone()
             red_mask = occ_orig == 1; blue_mask = occ_orig == 2
             occ[red_mask] = 2; occ[blue_mask] = 1
+            
             # Evaluate candidates with Blue model
             if len(valid_actions)==1:
                 best_idx=valid_actions[0]; best_move=self.all_vertices[best_idx]
@@ -1217,24 +1574,30 @@ class VectorGame:
                 if scores.dim()==0: sel=0
                 else: sel=torch.argmax(scores).item()
                 best_idx=valid_actions[sel]; best_move=self.all_vertices[best_idx]
+                
             # compute swapped reward
-            loops_before=self.find_formed_loops(clicks,self.load_valid_loops())
+            # OPTIMIZATION: Use cached valid_loops
+            loops_before=self.find_formed_loops(clicks, valid_loops)
             lc_before=self.get_loop_colors(loops_before,clicks)
             rsb,bsb=self.calculate_scores(lc_before)
             temp=clicks.copy(); temp.append({'turn':0,'color':'blue','address':best_move})
-            loops_after=self.find_formed_loops(temp,self.load_valid_loops())
+            loops_after=self.find_formed_loops(temp, valid_loops)
             lc_after=self.get_loop_colors(loops_after,temp)
             rsa,bsa=self.calculate_scores(lc_after)
+            
             # points from blue perspective as red: reward = (blue gain) - (red gain)
             rew=(bsa-bsb) - (rsa-rsb)
+            
             # next state tokens swap
             nidx,nocc_orig=self.state_to_tokens(temp)
             nocc=nocc_orig.clone(); red_mask=nocc_orig==1; blue_mask=nocc_orig==2
             nocc[red_mask]=2; nocc[blue_mask]=1
+            
             # train Blue model
             self.td_update_blue(state_idx,occ,rew,nidx,nocc,is_terminal=False)
             return best_move
-        # ...existing heuristic code...
+
+        # Use heuristic approach for Blue
         # Use passed aggression parameter or fallback
         if aggression is None:
             if hasattr(self, 'blue_ai_aggression'):
@@ -1251,7 +1614,7 @@ class VectorGame:
             
         if make_aggressive_move:
             scoring_moves = []
-            valid_loops = self.load_valid_loops()
+            # OPTIMIZATION: Use cached valid_loops
             formed_loops_before = self.find_formed_loops(clicks, valid_loops)
             loop_colors_before = self.get_loop_colors(formed_loops_before, clicks)
             red_score_before, blue_score_before = self.calculate_scores(loop_colors_before)
@@ -1587,7 +1950,9 @@ class VectorGame:
         elif delta_theta < -np.pi:
             delta_theta += 2 * np.pi
             
-        tolerance = 0.01
+        # Increased tolerance to better handle floating-point precision issues
+        # Especially for position (1.0, 4.71) vs (1.0, 4.713185307179586)
+        tolerance = 0.02  # Doubled from 0.01
         return np.sqrt((v1[0] - v2[0])**2 + delta_theta**2) < tolerance
 
     def calculate_triangle_center(self, triangle_vertices):
@@ -1732,7 +2097,11 @@ class VectorGame:
                     
                     # Check if this was the last move in the game
                     updated_clicks = self.load_clicks()
-                    self.update_game_state()
+                    
+                    # FIX: Check if Red's move was the final move and end the game if needed
+                    if len(updated_clicks) >= len(self.all_vertices):
+                        self.update_game_state()
+                        return
                     
                     # Player needs to click again to make their move
                     return
@@ -1785,14 +2154,15 @@ class VectorGame:
                 self.round_player_moves['red'] += 1
                 self.global_turn_number += 1
                 
-                # Check if this was the last move in the game
+                # Update game state and check for game end
                 updated_clicks = self.load_clicks()
                 if len(updated_clicks) >= len(self.all_vertices):
                     self.update_game_state()
                     return
         
         # Check if the round is complete (both players have moved)
-        if self.current_round_moves >= 2:
+        # FIX: Only advance round if BOTH players have moved in the current round
+        if self.current_round_moves >= 2 and self.round_player_moves['red'] >= 1 and self.round_player_moves['blue'] >= 1:
             # Reset for next round
             self.round_number += 1
             self.round_label.update_text(f"Round: {self.round_number}")
@@ -2227,13 +2597,21 @@ class VectorGame:
         # Get values from sliders
         self.depth = int(self.settings_ui.depth_slider.current_val)
         self.scale_multiplier = self.settings_ui.scale_slider.current_val
+        
+        # Keep red_first_slider as percentage (0-100)
         self.red_first_prob = int(self.settings_ui.red_first_slider.current_val)
-        self.red_ai_aggression = int(self.settings_ui.red_aggression_slider.current_val)
+        
+        # Convert red_ai_aggression_slider from -1 to 1 scale to 0-100%
+        self.red_ai_aggression = self.denormalize_slider_value(self.settings_ui.red_aggression_slider.current_val)
+        
         self.max_heuristic_evals = int(self.settings_ui.heuristic_evals_slider.current_val)
         
         # Get neural network settings
         self.use_neural_net = self.settings_ui.use_neural_net_checkbox.checked
-        self.neural_net_ratio = int(self.settings_ui.neural_net_ratio_slider.current_val)
+        
+        # Convert neural_net_ratio_slider from -1 to 1 scale to 0-100%
+        self.neural_net_ratio = self.denormalize_slider_value(self.settings_ui.neural_net_ratio_slider.current_val)
+        
         self.learning_rate = self.settings_ui.learning_rate_slider.current_val
         
         # Get neural network architecture settings
@@ -2555,6 +2933,10 @@ class VectorGame:
         print(f"Blue: AI/Heur={blue_ai_heur_ratio}%, Greedy/Random={blue_greedy_random_ratio}%, " +
               f"Locked={blue_locked}, End AI={blue_end_ai_ratio}%, Episodes={getattr(self, 'blue_episodes', 100)}")
         
+        # OPTIMIZATION: Load valid_loops once and keep in memory for the entire training session
+        # This avoids repeatedly loading the same data from disk
+        valid_loops = self.load_valid_loops()
+        
         # Setup training progress display
         progress_panel = Panel(
             self.screen_width // 2 - 200, 
@@ -2663,7 +3045,7 @@ class VectorGame:
                 training_cancelled = True
                 break
             
-            # Reset the game state
+            # Reset the game state for this episode but don't reload files
             self.reset_game_files()
             self.red_score = 0
             self.blue_score = 0
@@ -2687,11 +3069,11 @@ class VectorGame:
             while len(clicks) < len(self.all_vertices):
                 # Get AI move for current player
                 if current_player == 'red':
-                    # Red uses neural network with configured ratio
-                    move = self.get_red_move(clicks)
+                    # OPTIMIZATION: Pass clicks and valid_loops directly instead of loading from disk
+                    move = self.get_training_red_move(clicks, valid_loops)
                 else:
-                    # Blue uses heuristic with blue_ai_aggression
-                    move = self.get_blue_move(clicks, self.blue_ai_aggression)
+                    # OPTIMIZATION: Pass clicks and valid_loops directly instead of loading from disk
+                    move = self.get_training_blue_move(clicks, valid_loops, self.blue_ai_aggression)
                 
                 if move:
                     # Add the move
@@ -2737,7 +3119,7 @@ class VectorGame:
                 break
                 
             # Calculate the final score
-            valid_loops = self.load_valid_loops()
+            # OPTIMIZATION: use the cached valid_loops instead of loading from disk
             formed_loops = self.find_formed_loops(clicks, valid_loops)
             loop_colors = self.get_loop_colors(formed_loops, clicks)
             red_score, blue_score = self.calculate_scores(loop_colors)
@@ -2816,7 +3198,16 @@ class VectorGame:
         self.status_label.update_text(self.status_message)
 
     def td_update(self, state_idx, state_occ, reward, next_state_idx=None, next_state_occ=None, is_terminal=False):
-        """Perform a TD(0) update for the value (regression) network."""
+        """Stream-optimized truly incremental TD update with adaptive learning rate"""
+        # Initialize adaptive learning rate parameters if not present
+        if not hasattr(self, 'lr_min'):
+            self.lr_min = 0.0001  # Minimum learning rate
+            self.lr_max = 0.01    # Maximum learning rate
+            self.td_error_window = deque(maxlen=100)  # Track recent TD errors
+            self.lr_decay = 0.99   # Learning rate decay factor
+            self.lr_growth = 1.001  # Learning rate growth factor
+            self.learning_rates = []  # For monitoring
+        
         # Get current value estimate
         value = self.regression_net(state_idx, state_occ)
         
@@ -2828,23 +3219,45 @@ class VectorGame:
                 next_value = self.regression_net(next_state_idx, next_state_occ).item()
             raw_target = reward + self.gamma * next_value
         
-        # Update running buffer and compute normalization stats
-        self.target_buffer.append(raw_target)
-        import numpy as _np
-        mean = _np.mean(self.target_buffer)
-        std = _np.std(self.target_buffer)
-        if std < 1e-6:
-            std = 1.0
-        
-        # Normalize target
-        target_norm = (raw_target - mean) / std
-        
-        # Use batch training capability
-        loss = self.regression_net.train_step(state_idx, state_occ, target_norm, self.regression_optimizer)
-        
-        # Record actual TD error (unnormalized) for monitoring
+        # Calculate TD error (loss before optimization)
         td_error = raw_target - value.item()
         self.stats['td_errors'].append(td_error)
+        self.td_error_window.append(abs(td_error))
+        
+        # Adaptive learning rate based on TD error magnitude
+        if len(self.td_error_window) > 1:
+            mean_error = sum(self.td_error_window) / len(self.td_error_window)
+            if abs(td_error) > 1.5 * mean_error:
+                # Surprising outcome - increase learning rate to adapt faster
+                self.learning_rate = min(self.lr_max, self.learning_rate * self.lr_growth)
+            else:
+                # Expected outcome - decrease learning rate for fine-tuning
+                self.learning_rate = max(self.lr_min, self.learning_rate * self.lr_decay)
+            
+            # Update optimizer with new learning rate
+            for param_group in self.regression_optimizer.param_groups:
+                param_group['lr'] = self.learning_rate
+        
+        # Save learning rate for monitoring
+        self.learning_rates.append(self.learning_rate)
+        
+        # Streaming normalization of TD targets
+        self.target_buffer.append(raw_target)
+        import numpy as _np
+        # Use running statistics for normalization (streaming z-score)
+        mean = _np.mean(self.target_buffer)
+        std = _np.std(self.target_buffer) 
+        std = max(std, 1e-6)  # Avoid divide by zero
+        
+        # Normalize target (helps with gradient scale)
+        target_norm = (raw_target - mean) / std
+        
+        # Truly incremental single-step optimization with importance sampling
+        loss = self.regression_net.train_step(state_idx, state_occ, target_norm, self.regression_optimizer)
+        
+        # Record stats for monitoring
+        if loss is not None:
+            self.stats['value_losses'].append(loss)
         
         return loss
 
@@ -3035,3 +3448,18 @@ class VectorGame:
             self.status_message = f"Error loading model: {e}"
             self.status_label.update_text(self.status_message)
             return False
+
+    # Normalization helper methods for slider values
+    @property
+    def red_ai_aggression_normalized(self):
+        """Convert 0-100 scale to -1 to 1 scale for red_ai_aggression slider"""
+        return (self.red_ai_aggression / 50) - 1
+        
+    @property
+    def neural_net_ratio_normalized(self):
+        """Convert 0-100 scale to -1 to 1 scale for neural_net_ratio slider"""
+        return (self.neural_net_ratio / 50) - 1
+    
+    def denormalize_slider_value(self, normalized_value):
+        """Convert -1 to 1 scale back to 0-100 scale"""
+        return int((normalized_value + 1) * 50)

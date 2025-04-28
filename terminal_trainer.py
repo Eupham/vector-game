@@ -20,6 +20,7 @@ import random
 import numpy as np
 from game_logic import VectorGame
 from neural_networks import RegressionNetwork
+from ai import integrate_quiescence_search  # Add quiescence integration
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -52,6 +53,8 @@ def parse_arguments():
                         help='Directory for saving training logs')
     parser.add_argument('--quiet', action='store_true',
                         help='Reduce output verbosity')
+    parser.add_argument('--quiescence-ratio', type=float, default=0,
+                        help='Probability (0-100) to use quiescence search instead of heuristic')
     
     return parser.parse_args()
 
